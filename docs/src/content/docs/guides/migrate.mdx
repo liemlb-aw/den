@@ -17,9 +17,8 @@ Migration to Den is incremental. You do not need to rewrite everything at once.
 
     ```nix
     {
-      inputs.den.url = "github:vic/den";
-      inputs.import-tree.url = "github:vic/import-tree";
-      inputs.flake-aspects.url = "github:vic/flake-aspects";
+      inputs.den.url = "github:denful/den";
+      inputs.import-tree.url = "github:denful/import-tree";
 
       outputs = inputs: inputs.flake-parts.lib.mkFlake { inherit inputs; }
         (inputs.import-tree ./modules);
@@ -45,16 +44,16 @@ Migration to Den is incremental. You do not need to rewrite everything at once.
 
 3. Import Existing Modules
 
-    Use `den.provides.import-tree` to load your existing non-dendritic modules:
+    Use `den.batteries.import-tree` to load your existing non-dendritic modules:
 
     ```nix
     # modules/legacy.nix
     { den, ... }: {
-      den.ctx.host.includes = [
-        (den.provides.import-tree._.host ./hosts)
+      den.schema.host.includes = [
+        (den.batteries.import-tree.host ./hosts)
       ];
-      den.ctx.user.includes = [
-        (den.provides.import-tree._.user ./users)
+      den.schema.user.includes = [
+        (den.batteries.import-tree.user ./users)
       ];
     }
     ```
@@ -106,7 +105,7 @@ Migration to Den is incremental. You do not need to rewrite everything at once.
 5. Remove Legacy
 
     As aspects replace legacy modules, remove the corresponding files from
-    `hosts/` and `users/`. Eventually remove `den.provides.import-tree` usage.
+    `hosts/` and `users/`. Eventually remove `den.batteries.import-tree` usage.
 
 </Steps>
 
@@ -115,5 +114,5 @@ Migration to Den is incremental. You do not need to rewrite everything at once.
 - **Start with one host.** Migrate a single machine first to learn the pattern.
 - **Keep legacy working.** `import-tree` loads your existing files alongside
   Den aspects -- they coexist without conflicts.
-- **Use batteries.** Replace manual user/shell/HM setup with `den.provides.*`.
+- **Use batteries.** Replace manual user/shell/HM setup with `den.batteries.*`.
 - **Test with VM.** Use `nix run .#vm` to validate changes before applying to hardware.

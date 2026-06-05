@@ -1,37 +1,21 @@
+{ lib, ... }:
 {
-  config,
-  lib,
-  ...
-}:
-let
+  options.den.config = {
+    classModuleCollisionPolicy = lib.mkOption {
+      description = ''
+        How to handle collisions between den context args and module-system args
+        in flat-form class modules.
 
-  build =
-    builder: cfg:
-    let
-      items = map builtins.attrValues (builtins.attrValues cfg);
-      buildItem = item: lib.setAttrByPath item.intoAttr (builder item);
-      built = map buildItem (lib.flatten items);
-    in
-    built;
-
-  osConfiguration =
-    host:
-    host.instantiate {
-      modules = [
-        host.mainModule
-        { nixpkgs.hostPlatform = lib.mkDefault host.system; }
+        - "error": throw on collision (default)
+        - "class-wins": module-system value wins, den value dropped
+        - "den-wins": den value wins, module-system value shadowed
+      '';
+      type = lib.types.enum [
+        "error"
+        "class-wins"
+        "den-wins"
       ];
+      default = "error";
     };
-
-  homeConfiguration =
-    home:
-    home.instantiate {
-      pkgs = home.pkgs;
-      modules = [ home.mainModule ];
-    };
-
-  configs = (build osConfiguration config.den.hosts) ++ (build homeConfiguration config.den.homes);
-in
-{
-  config.flake = lib.mkMerge configs;
+  };
 }

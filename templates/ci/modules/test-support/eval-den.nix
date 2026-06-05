@@ -1,90 +1,29 @@
 {
   inputs,
+  denTest,
   lib,
-  withSystem,
   ...
 }:
-let
-  # isolated test, prevent polution between tests.
-  denTest = module: {
-    inherit ((evalDen module).config) expr expected;
-  };
-
-  evalDen =
-    module:
-    lib.evalModules {
-      specialArgs = {
-        inherit inputs;
-        inherit withSystem;
-      };
-      modules = [
-        module
-        testModule
-        helpersModule
-      ];
-    };
-
-  testModule = {
-    imports = [ inputs.den.flakeModule ];
-    options.flake.nixosConfigurations = lib.mkOption { };
-    options.flake.darwinConfigurations = lib.mkOption { };
-    options.flake.homeConfigurations = lib.mkOption { };
-    options.flake.packages = lib.mkOption { };
-    options.expr = lib.mkOption { };
-    options.expected = lib.mkOption { };
-    config.den.base.user.classes = lib.mkDefault [ "homeManager" ];
-  };
-
-  helpersModule =
-    { config, ... }:
-    let
-
-      iceberg = config.flake.nixosConfigurations.iceberg.config;
-      apple = config.flake.darwinConfigurations.apple.config;
-      igloo = config.flake.nixosConfigurations.igloo.config;
-      tuxHm = igloo.home-manager.users.tux;
-      pinguHm = igloo.home-manager.users.pingu;
-
-      sort = lib.sort (a: b: a < b);
-      show = items: builtins.trace (lib.concatStringsSep " / " (lib.flatten [ items ]));
-
-      funnyNames =
-        aspect:
-        let
-          mod = aspect.resolve { class = "funny"; };
-          namesMod = {
-            options.names = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [ ];
-            };
-          };
-          res = lib.evalModules {
-            modules = [
-              mod
-              namesMod
-            ];
-          };
-        in
-        sort res.config.names;
-
-    in
-    {
-      _module.args = {
-        inherit
-          show
-          funnyNames
-          apple
-          igloo
-          iceberg
-          tuxHm
-          pinguHm
-          ;
-      };
-    };
-
-in
 {
-  _module.args = { inherit denTest evalDen; };
+  imports = [
+    inputs.den.flakeModules.denTest
+    inputs.den.flakeOutputs.tests
+  ];
 
-  flake.packages.x86_64-linux.hello = inputs.nixpkgs.legacyPackages.x86_64-linux.hello;
+  options.flake = {
+    denTest = lib.mkOption { };
+    den = lib.mkOption { };
+  };
+
+  config.flake = {
+    inherit denTest;
+    den =
+      (denTest (
+        { den, ... }:
+        {
+          expr = den;
+          expected = den;
+        }
+      )).expr;
+  };
 }

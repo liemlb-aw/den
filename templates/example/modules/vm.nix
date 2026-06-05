@@ -5,8 +5,8 @@
 {
 
   den.aspects.igloo.includes = [
-    eg.vm._.gui
-    # eg.vm._.tui
+    eg.vm.gui
+    # eg.vm.tui
   ];
 
   perSystem =

@@ -1,12 +1,19 @@
 ---
 
-name: Bug report
-about: Issues are testable/actionable tasks. Use Discussions for questions, feature-requests, problem solving.
+name: Bug report with tests
+about: "Issues are for maintainer's time-allocated tasks! Use Discussions for questions, feature-requests, problem solving, etc."
 title: 'BUG: '
 labels: 'bug'
 assignees: ''
 
 ---
+
+> [!NOTE]
+> The BUG tag is for failing code with tests.
+> DO-NOT use it unless you have code for a failing test.
+> You are welcome to send either bogus repo or just a `denTest` code snippet reproducing a bug.
+> Issues are for maintainer's time-allocated tasks! Use Discussions for questions, feature-requests, problem solving, etc.
+
 Please read https://den.oeiuwq.com/tutorials/bogus/ first.
 
 If you have found a bug, please share a reproduction repository with us.
@@ -14,7 +21,7 @@ If you have found a bug, please share a reproduction repository with us.
 First step is to clone the `bogus` template and edit `modules/bug.nix`.
 
 ```console
-nix flake init -t github:vic/den#bogus
+nix flake init -t github:denful/den#bogus
 nix flake update den
 vim modules/bug.nix
 nix flake check
@@ -28,4 +35,4 @@ If you found a bug regression please edit the CI workflow to include main and an
 
 Provide a very small description of the intended and the actual behaviour.
 
-Share a link to a [discussion](https://github.com/vic/den/discussions) to keep track of it.
+Share a link to a [discussion](https://github.com/denful/den/discussions) to keep track of it.

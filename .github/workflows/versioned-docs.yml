@@ -1,0 +1,32 @@
+name: Versioned docs
+on:
+  workflow_dispatch:
+  push:
+    tags: ["*"]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.number }}
+  cancel-in-progress: true
+env:
+  NIX_PATH: "nixpkgs=https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.xz"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: wimpysworld/nothing-but-nix@v10
+      - uses: cachix/install-nix-action@v31
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+      - uses: actions/checkout@v6
+      - name: Build
+        run: nix-shell --run 'just docs-build'
+      - name: Version
+        run: |
+          pushd docs
+          rg '(src|href)="/' dist -l -0 | xargs -0 -n 1 sed -i 's#\(src\|href\)="/#\1="/${{github.ref_name}}/#g'
+          mkdir -p versioned
+          mv dist versioned/${{github.ref_name}}
+          popd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-${{github.ref_name}}
+          path: ./docs/versioned
+          overwrite: true

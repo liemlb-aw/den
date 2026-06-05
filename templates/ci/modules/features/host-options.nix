@@ -20,14 +20,7 @@
       {
         den.hosts.x86_64-linux.igloo.users.tux = { };
         den.default.homeManager.home.stateVersion = "25.11";
-        den.default.includes = [
-          (
-            { host, ... }:
-            {
-              ${host.class}.networking.hostName = host.hostName;
-            }
-          )
-        ];
+        den.default.includes = [ den.provides.hostname ];
 
         expr = igloo.networking.hostName;
         expected = "igloo";
@@ -38,7 +31,7 @@
       { den, config, ... }:
       {
         den.hosts.x86_64-linux.igloo = {
-          aspect = "my-custom-aspect";
+          aspect = den.aspects.my-custom-aspect;
           users.tux = { };
         };
         den.default.homeManager.home.stateVersion = "25.11";
@@ -54,19 +47,31 @@
       {
         den.hosts.x86_64-linux.igloo.users.tux = { };
 
-        expr = den.hosts.x86_64-linux.igloo.aspect;
+        expr = den.hosts.x86_64-linux.igloo.name;
         expected = "igloo";
       }
     );
 
     test-user-custom-username = denTest (
-      { den, igloo, ... }:
       {
-        den.hosts.x86_64-linux.igloo.users.tux = {
-          userName = "penguin";
-        };
-        den.default.homeManager.home.stateVersion = "25.11";
-        den.aspects.igloo.includes = [ den._.define-user ];
+        den,
+        lib,
+        igloo,
+        ...
+      }:
+      let
+        inherit (den.lib.policy) include;
+      in
+      {
+        den.hosts.x86_64-linux.igloo.users.tux.userName = "penguin";
+        den.aspects.igloo.policies.to-users =
+          { host, user, ... }:
+          [
+            (include {
+              includes = [ den.provides.define-user ];
+            })
+          ];
+        den.aspects.igloo.includes = [ den.aspects.igloo.policies.to-users ];
 
         expr = igloo.users.users.penguin.isNormalUser;
         expected = true;

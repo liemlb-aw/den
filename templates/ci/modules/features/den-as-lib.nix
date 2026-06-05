@@ -31,16 +31,6 @@ in
         inherit expr expected;
       };
 
-    test-module-has-empty-ctx =
-      let
-        ev = lib.evalModules { modules = [ denModule ]; };
-        expr = lib.attrNames ev.config.den.ctx;
-        expected = [ ];
-      in
-      {
-        inherit expr expected;
-      };
-
     test-module-has-empty-aspects =
       let
         ev = lib.evalModules { modules = [ denModule ]; };
@@ -56,8 +46,10 @@ in
         names = [
           "hosts"
           "homes"
-          "base"
+          "schema"
           "default"
+          "provides"
+          "ful"
         ];
         ev = lib.evalModules { modules = [ denModule ]; };
         expr = builtins.all (name: !ev.config.den ? ${name}) names;
@@ -76,33 +68,57 @@ in
           ];
         };
 
+        fooIncludes = [
+          (
+            { name }:
+            {
+              my.names = [ "foo ${name}" ];
+            }
+          )
+        ];
+
         module =
           { den, lib, ... }:
           {
-            den.ctx.foo.provides.foo =
-              { name }:
+            den.policies.foo-to-bar =
               {
-                my.names = [ "foo ${name}" ];
-              };
-            den.ctx.foo.into.bar = { name }: lib.singleton { shout = lib.toUpper name; };
-            den.ctx.foo.provides.bar =
-              { shout }:
-              {
-                my.names = [ "foo shouted ${shout}" ];
-              };
-
-            den.ctx.bar.provides.bar =
-              { shout }:
-              {
-                my.names = [ "bar ${shout}" ];
-              };
+                __entityKind ? null,
+                ...
+              }@ctx:
+              let
+                inherit (den.lib.policy) resolve include;
+              in
+              if __entityKind != "foo" then
+                [ ]
+              else if ctx ? name then
+                [
+                  (resolve.to "bar" { shout = lib.toUpper ctx.name; })
+                  (include (
+                    { shout }:
+                    {
+                      my.names = [ "bar ${shout}" ];
+                    }
+                  ))
+                ]
+              else
+                [ ];
 
             den.aspects.foobar.includes = [
-              (den.ctx.foo { name = "good"; })
+              den.policies.foo-to-bar
+              # resolveEntity results carry __scopeHandlers which are
+              # destroyed by providerType merge. Wrap in a function
+              # so it's called at resolution time, not definition time.
+              (
+                { class, ... }:
+                let
+                  entity = den.lib.resolveEntity "foo" { name = "good"; };
+                in
+                entity // { includes = entity.includes ++ fooIncludes; }
+              )
             ];
           };
 
-        myMod = ev.config.den.aspects.foobar.resolve { class = "my"; };
+        myMod = ev.config.den.lib.aspects.resolve "my" ev.config.den.aspects.foobar;
         nameMod.options.names = lib.mkOption { type = lib.types.listOf lib.types.str; };
         ev2 = lib.evalModules {
           modules = [
@@ -113,7 +129,6 @@ in
 
         expr = ev2.config.names;
         expected = [
-          "foo shouted GOOD"
           "bar GOOD"
           "foo good"
         ];

@@ -16,11 +16,12 @@
         # USER TODO: remove this
         boot.loader.grub.enable = false;
         fileSystems."/".device = "/dev/null";
+        fileSystems."/".fsType = "auto";
       };
   };
 
   den.aspects.tux = {
-    includes = [ den.provides.primary-user ];
+    includes = [ den.batteries.primary-user ];
     user.extraGroups = [ "audio" ];
   };
 }

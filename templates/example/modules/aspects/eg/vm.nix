@@ -1,15 +1,15 @@
 { eg, ... }:
 {
-  eg.vm.provides = {
+  eg.vm = {
     gui.includes = [
       eg.vm
-      eg.vm-bootable._.gui
+      eg.vm-bootable.gui
       eg.xfce-desktop
     ];
 
     tui.includes = [
       eg.vm
-      eg.vm-bootable._.tui
+      eg.vm-bootable.tui
     ];
   };
 }
