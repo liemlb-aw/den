@@ -44,16 +44,16 @@ Migration to Den is incremental. You do not need to rewrite everything at once.
 
 3. Import Existing Modules
 
-    Use `den.batteries.import-tree` to load your existing non-dendritic modules:
+    Use `den.batteries.import-tree` to load your existing plain modules:
 
     ```nix
     # modules/legacy.nix
     { den, ... }: {
       den.schema.host.includes = [
-        (den.batteries.import-tree.host ./hosts)
+        (den.batteries.import-tree.provides.host ./hosts)
       ];
       den.schema.user.includes = [
-        (den.batteries.import-tree.user ./users)
+        (den.batteries.import-tree.provides.user ./users)
       ];
     }
     ```

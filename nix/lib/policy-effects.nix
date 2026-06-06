@@ -101,7 +101,10 @@ in
   # Tier 1 delivery — replaces den.batteries.forward for the common case.
   route = spec: {
     __policyEffect = "route";
-    value = spec;
+    value = {
+      path = [ ];
+    }
+    // spec;
   };
 
   # Request post-pipeline instantiation of an entity's class content.
@@ -119,6 +122,21 @@ in
     __policyEffect = "provide";
     value = spec;
   };
+
+  # Request a deferred node spawn. Records a marker resolved post-walk
+  # over the parent pipeline's full scope-tree state (host + siblings), so the
+  # projected home content sees fleet-wide pipe values. `classes` defaults to
+  # the user's classes (or homeManager) at the drain site when null.
+  spawn =
+    {
+      classes ? null,
+    }:
+    {
+      __policyEffect = "spawn";
+      value = {
+        inherit classes;
+      };
+    };
 
   # Pipe transform builder — policies use pipe.from to attach transform
   # stages (filter, transform, fold, append, for) to a named pipe.
@@ -166,6 +184,10 @@ in
     };
     collect = pred: {
       __pipeStage = "collect";
+      fn = pred;
+    };
+    collectAll = pred: {
+      __pipeStage = "collectAll";
       fn = pred;
     };
   };

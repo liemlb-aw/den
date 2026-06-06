@@ -7,8 +7,30 @@
   collectClassMods,
 }:
 let
+  # Root-scope `fromClass` content a child-scope forward may pull in. When
+  # `fromClass` is a class some entity in the chain owns, root content under it
+  # is that entity's own declaration, not aggregation fodder — restrict to
+  # shared `den.default` (host class content reaches users opt-in via
+  # host-aspects). A custom forward-only class (e.g. `atuin`) only exists to
+  # feed forwards, so its root content is a legitimate source; keep it in full.
+  filterRootModules =
+    scopeContexts: spec: rootModules: isDenDefaultModule:
+    let
+      childCtx = scopeContexts.${spec.sourceScopeId} or { };
+      # Classes owned by each entity kind in the chain. Total over kinds so the
+      # filter never falls open for a non-user-owned scope (host, standalone home).
+      ownedClasses =
+        (childCtx.user.classes or [ ])
+        ++ lib.optional (childCtx ? host) childCtx.host.class
+        ++ lib.optional (childCtx ? home) childCtx.home.class;
+    in
+    if builtins.elem spec.fromClass ownedClasses then
+      builtins.filter isDenDefaultModule rootModules
+    else
+      rootModules;
+
   getCollectedSource =
-    acc: spec: rootScopeId: isDenDefaultModule:
+    acc: spec: rootScopeId: isDenDefaultModule: scopeContexts:
     let
       sid = spec.sourceScopeId;
     in
@@ -17,24 +39,31 @@ let
         ownModules = (acc.perScope.${sid} or { }).${spec.fromClass} or [ ];
         rootModules = (acc.perScope.${rootScopeId} or { }).${spec.fromClass} or [ ];
       in
-      builtins.filter isDenDefaultModule rootModules ++ ownModules
+      filterRootModules scopeContexts spec rootModules isDenDefaultModule ++ ownModules
     else
       acc.classImports.${spec.fromClass} or [ ];
 
   resolveSourceFallback =
-    spec: fxResolve: scopeContexts: ctx:
-    if !(spec ? sourceAspect) || fxResolve == null then
+    spec: spawnNode: scopeParent: scopeContexts: ctx:
+    # Early-out to no source: the spec has nothing to resolve from (no source
+    # aspect/scope), or spawnNode wasn't threaded (non-home callers pass
+    # null via the applyRoutes default).
+    if !(spec ? sourceAspect) || spawnNode == null || !(spec ? sourceScopeId) then
       [ ]
     else
-      let
-        normalized = den.lib.aspects.normalizeRoot spec.sourceAspect;
-        sourceCtx = scopeContexts.${spec.sourceScopeId} or ctx;
-      in
-      (fxResolve {
+      (spawnNode {
+        # spec.sourceScopeId is the USER scope (the forward compiles at the
+        # current scope, per compile-forward.nix sourceScopeId = scope). `from`
+        # must be the HOST scope = the user scope's parent. Using sourceScopeId
+        # directly gives a self-parent edge -> policyBoundAncestor returns null
+        # -> zero fleet peers (and spawnNode's spawnRoot == from assert trips).
+        from = scopeParent.${spec.sourceScopeId} or spec.sourceScopeId;
         class = spec.fromClass;
-        self = normalized;
-        ctx =
-          sourceCtx // den.lib.aspects.fx.aspect.ctxFromHandlers (spec.sourceAspect.__scopeHandlers or { });
+        aspect = den.lib.aspects.normalizeRoot spec.sourceAspect;
+        # The user binding is re-supplied by the source aspect's __scopeHandlers
+        # (ctxFromHandlers in spawnNode's seedCtx), so spawnRoot resolves to
+        # the user scope; do NOT strip it here.
+        bindings = { };
       }).imports;
 
   appendToClass = acc: cls: sid: newMods: {
@@ -54,16 +83,20 @@ let
       route,
       rootScopeId,
       scopeContexts,
+      scopeParent,
       ctx,
-      fxResolve,
+      spawnNode,
       buildForwardAspect,
       isDenDefaultModule,
     }:
     let
       spec = route;
-      collected = getCollectedSource acc spec rootScopeId isDenDefaultModule;
+      collected = getCollectedSource acc spec rootScopeId isDenDefaultModule scopeContexts;
       sourceModules =
-        if collected != [ ] then collected else resolveSourceFallback spec fxResolve scopeContexts ctx;
+        if collected != [ ] then
+          collected
+        else
+          resolveSourceFallback spec spawnNode scopeParent scopeContexts ctx;
       sourceModule = spec.mapModule { imports = sourceModules; };
       newMods = collectClassMods spec.intoClass (buildForwardAspect spec sourceModule);
     in
@@ -241,6 +274,43 @@ let
     in
     go { } rawRoutes;
 
+  # Topologically sort routes: when forward A's intoClass feeds forward
+  # B's fromClass at the same scope, A must fire before B.  Only
+  # reorders __complexForward routes; non-forward routes keep their
+  # original position relative to other non-forwards.  (#567)
+  topoSortRoutes =
+    routes:
+    let
+      indexed = lib.imap0 (i: r: { inherit i r; }) routes;
+      # Build producer map: intoClass@scope → [route indices].  Both simple
+      # routes and complex forwards are producers: a simple route injecting
+      # into a home-env class (e.g. homeManager) feeds the complex forward that
+      # carries that class to its host output (makeHomeEnv's userForward).
+      # Complex forwards read from the accumulating fold state, so any producer
+      # of their fromClass must fire first or the injected content is lost.
+      producerMap = builtins.foldl' (
+        acc:
+        { i, r }:
+        let
+          key = "${r.intoClass}@${r.sourceScopeId}";
+        in
+        acc // { ${key} = (acc.${key} or [ ]) ++ [ i ]; }
+      ) { } indexed;
+      # A complex forward "depends on producers" when its fromClass@scope has
+      # producer entries from *other* routes (meaning another route produces
+      # into the class it consumes).  Simple routes read the original per-scope
+      # data, not the fold state, so they never depend on ordering themselves.
+      hasDeps =
+        { i, r }:
+        (r.__complexForward or false)
+        && builtins.any (j: j != i) (producerMap."${r.fromClass}@${r.sourceScopeId}" or [ ]);
+      # Partition: routes without deps first, routes with deps last.
+      # This is a single-level toposort (sufficient for A→B chains).
+      noDeps = builtins.filter (ir: !hasDeps ir) indexed;
+      withDeps = builtins.filter hasDeps indexed;
+    in
+    map (ir: ir.r) (noDeps ++ withDeps);
+
   # Main entry: dedup routes, fold applying each.
   applyRoutes =
     {
@@ -250,12 +320,14 @@ let
       scopeParent ? { },
       scopeContexts ? { },
       ctx ? { },
-      fxResolve ? null,
+      spawnNode ? null,
       rootScopeId ? null,
       buildForwardAspect ? null,
     }:
     let
-      allRoutes = dedupRoutes rootScopeId (lib.concatLists (lib.attrValues scopedRoutes));
+      allRoutes = topoSortRoutes (
+        dedupRoutes rootScopeId (lib.concatLists (lib.attrValues scopedRoutes))
+      );
     in
     builtins.foldl'
       (
@@ -266,8 +338,9 @@ let
               route
               rootScopeId
               scopeContexts
+              scopeParent
               ctx
-              fxResolve
+              spawnNode
               buildForwardAspect
               isDenDefaultModule
               ;

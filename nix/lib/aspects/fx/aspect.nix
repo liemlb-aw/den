@@ -101,9 +101,36 @@ let
           args: rawFn (args // { __scopeKeys = builtins.attrNames scopeHandlers; })
         else
           rawFn;
-      bound = fx.bind.fn (aspect.__args or { }) fn;
+      # nix-effects bind.fn uses lib.functionArgs internally but __args
+      # overrides win via //. Values of true (= has default / optional) must
+      # use the bindAttrs sentinel so the handler probe kicks in; passing
+      # literal true would send it as a param and throw when unhandled.
+      optionalArg = {
+        __bindAttrsOptional = true;
+      };
+      args = lib.mapAttrs (_: v: if v == true then optionalArg else v) (aspect.__args or { });
+      # Positional functions (no named args): call with scope context
+      # so they receive host/user/home info.  (#575)
+      isPositionalFn = args == { } && lib.isFunction rawFn && lib.functionArgs rawFn == { };
     in
-    if scopeFn != null then scopeFn bound else bound;
+    if isPositionalFn && scopeHandlers != null then
+      let
+        fullCtx = ctxFromHandlers scopeHandlers;
+        # Intersect with schema-defined entity kinds so positional
+        # functions see only entity bindings (host, user, home, ...)
+        # not framework keys (class, system).  (#575)
+        entityKeys = builtins.removeAttrs (den.schema or { }) [
+          "conf"
+          "_module"
+        ];
+        ctx = builtins.intersectAttrs entityKeys fullCtx;
+      in
+      (if scopeFn != null then scopeFn else lib.id) (fx.pure (rawFn ctx))
+    else
+      let
+        bound = fx.bind.fn args fn;
+      in
+      if scopeFn != null then scopeFn bound else bound;
 
 in
 {

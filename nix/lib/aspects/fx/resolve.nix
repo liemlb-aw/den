@@ -8,6 +8,7 @@
 let
   inherit (import ./wrap-classes.nix { inherit lib den; }) wrapCollectedClasses;
   inherit (import ./assemble-pipes.nix { inherit lib den; }) assemblePipes;
+  inherit (import ./spawn-node.nix { inherit lib den; }) mkSpawnNode;
   route = import ./route { inherit lib den; };
   handlers = den.lib.aspects.fx.handlers;
 
@@ -146,9 +147,12 @@ let
       }
     ) acc allProvides;
 
-  # Phase 3: Apply routes.
+  # Phase 3: Apply routes. The first positional is the node spawn primitive
+  # (threaded with this pipeline's parent scope-tree state) used to resolve a
+  # complex-route forward SOURCE with full fleet visibility (replaces the old
+  # isolated fxResolve fallback).
   applyRoutes =
-    fxResolve: ctx: scopeContexts: rootScopeId: scopeParent: scopedRoutes: acc:
+    spawnNode: ctx: scopeContexts: rootScopeId: scopeParent: scopedRoutes: acc:
     route.applyRoutes {
       inherit
         scopedRoutes
@@ -156,7 +160,7 @@ let
         scopeParent
         ctx
         rootScopeId
-        fxResolve
+        spawnNode
         ;
       wrappedPerScope = acc.perScope;
       classImports = acc.classImports;
@@ -249,29 +253,136 @@ let
     in
     if deduped == [ ] then null else deduped;
 
-  # Phase 4: Apply entity instantiation.
-  # When hosts were walked in the flake pipeline (via resolve.to "host"),
-  # re-run assembly phases per host subtree with the host as rootScopeId.
-  # This produces correct routing (identical to per-host fxResolve) while
-  # reusing the walk's scope data — including sibling visibility for pipe.collect.
-  applyInstantiates =
+  # Build instantiateArgs for a spec without calling spec.instantiate.
+  # Factored out so both applyInstantiates and hostConfigs can reuse it.
+  mkInstantiateArgs =
     {
-      scopedInstantiates,
-      # Raw walk data for per-host-subtree assembly.
       augmentedScopeContexts,
       scopedClassImportsRaw,
       scopedProvides,
       scopedRoutes,
       scopeParent,
       scopeEntityClass ? (_: { }),
-      fxResolveFn,
+      spawnNodeFn,
+      ctx,
+    }:
+    spec:
+    let
+      allScopeIds = builtins.attrNames augmentedScopeContexts;
+      hostClass = spec.class or "nixos";
+      rawHostScopeId = findHostScopeId scopeParent allScopeIds spec;
+      hostScopeId = if rawHostScopeId != null then rawHostScopeId else spec.sourceScopeId;
+      preWalkedModules =
+        if hostScopeId != null then
+          let
+            isInSubtree =
+              sid:
+              sid == hostScopeId
+              || (
+                let
+                  parent = scopeParent.${sid} or null;
+                in
+                parent != null && parent != sid && isInSubtree parent
+              );
+            isAncestor =
+              sid:
+              let
+                parent = scopeParent.${hostScopeId} or null;
+              in
+              sid == parent || (parent != null && parent != hostScopeId && isAncestorOf scopeParent sid parent);
+            isRelevant = sid: isInSubtree sid || isAncestor sid;
+            subtreeScopeIds = builtins.filter isInSubtree allScopeIds;
+            relevantScopeIds = builtins.filter isRelevant allScopeIds;
+            scopeEntityClassMap = scopeEntityClass null;
+            subtreeContexts = lib.genAttrs subtreeScopeIds (
+              sid:
+              let
+                base = augmentedScopeContexts.${sid};
+                entityCls = scopeEntityClassMap.${sid} or null;
+              in
+              if !(base ? class) && entityCls != null then
+                base // { class = entityCls; }
+              else if !(base ? class) then
+                base // { class = hostClass; }
+              else
+                base
+            );
+            subtreeClassImports = lib.genAttrs subtreeScopeIds (sid: scopedClassImportsRaw.${sid} or { });
+            subtreeProvides = lib.filterAttrs (sid: _: isRelevant sid) scopedProvides;
+            subtreeRoutes = lib.filterAttrs (sid: _: isRelevant sid) scopedRoutes;
+            relevantContexts = lib.genAttrs relevantScopeIds (sid: augmentedScopeContexts.${sid});
+            subtreePhase1 = wrapPerScope ctx subtreeContexts subtreeClassImports;
+            subtreePhase2 = applyProvides ctx relevantContexts subtreeProvides subtreePhase1;
+            subtreePhase3 =
+              applyRoutes spawnNodeFn ctx relevantContexts hostScopeId scopeParent subtreeRoutes
+                subtreePhase2;
+          in
+          extractSubtreeModules subtreePhase3.perScope scopeParent hostScopeId hostClass
+        else
+          null;
+      modules =
+        if preWalkedModules != null then
+          preWalkedModules
+        else
+          lib.optional (spec ? mainModule) spec.mainModule;
+    in
+    if spec ? pkgs then
+      {
+        inherit (spec) pkgs;
+        inherit modules;
+      }
+    else
+      {
+        inherit modules;
+      }
+      // lib.optionalAttrs (spec ? system) {
+        modules = modules ++ [
+          { nixpkgs.hostPlatform = lib.mkDefault spec.system; }
+        ];
+      };
+
+  # Phase 4: Apply entity instantiation.
+  # When hosts were walked in the flake pipeline (via resolve.to "host"),
+  # re-run assembly phases per host subtree with the host as rootScopeId.
+  # This produces correct routing (identical to per-host fxResolve) while
+  # reusing the walk's scope data — including sibling visibility for pipe.collect.
+  #
+  # Lazy: spec.instantiate is NOT called eagerly. Each output leaf is a thunk
+  # that calls spec.instantiate only when accessed (e.g., when someone reads
+  # config.flake.nixosConfigurations.cortex). This avoids evaluating all hosts
+  # when only one is needed.
+  applyInstantiates =
+    {
+      scopedInstantiates,
+      augmentedScopeContexts,
+      scopedClassImportsRaw,
+      scopedProvides,
+      scopedRoutes,
+      scopeParent,
+      scopeEntityClass ? (_: { }),
+      spawnNodeFn,
       ctx,
     }:
     classImports:
     let
+      mkArgs = mkInstantiateArgs {
+        inherit
+          augmentedScopeContexts
+          scopedClassImportsRaw
+          scopedProvides
+          scopedRoutes
+          scopeParent
+          scopeEntityClass
+          spawnNodeFn
+          ctx
+          ;
+      };
+
       allInstantiates = lib.concatLists (lib.attrValues scopedInstantiates);
-      allScopeIds = builtins.attrNames augmentedScopeContexts;
-      instantiateModules = lib.concatMap (
+
+      # Build spec descriptors: { path, system, spec } without calling instantiate.
+      # concatMap is strict in the list but the instantiate thunk is deferred.
+      specDescriptors = lib.concatMap (
         spec:
         let
           hasOutput = (spec.intoAttr or [ ]) != [ ];
@@ -279,101 +390,73 @@ let
         if !hasOutput then
           [ ]
         else
-          let
-            hostClass = spec.class or "nixos";
-            rawHostScopeId = findHostScopeId scopeParent allScopeIds spec;
-            # Fall back to source scope when no entity scope matches.
-            # This allows policy.instantiate to collect from any scope level
-            # (e.g., flake-system scope for perSystem class collection).
-            hostScopeId = if rawHostScopeId != null then rawHostScopeId else spec.sourceScopeId;
-            # Re-run assembly phases for the host subtree with correct rootScopeId.
-            preWalkedModules =
-              if hostScopeId != null then
-                let
-                  # Filter walk data to this host's subtree + ancestors.
-                  # Subtree: host scope + all descendants (users, etc.)
-                  # Ancestors: parent scopes up to root (flake-system, flake)
-                  # Excludes sibling subtrees (other hosts) to prevent cross-contamination.
-                  isInSubtree =
-                    sid:
-                    sid == hostScopeId
-                    || (
-                      let
-                        parent = scopeParent.${sid} or null;
-                      in
-                      parent != null && parent != sid && isInSubtree parent
-                    );
-                  isAncestor =
-                    sid:
-                    let
-                      parent = scopeParent.${hostScopeId} or null;
-                    in
-                    sid == parent || (parent != null && parent != hostScopeId && isAncestorOf scopeParent sid parent);
-                  isRelevant = sid: isInSubtree sid || isAncestor sid;
-                  subtreeScopeIds = builtins.filter isInSubtree allScopeIds;
-                  relevantScopeIds = builtins.filter isRelevant allScopeIds;
-                  scopeEntityClassMap = scopeEntityClass null;
-                  subtreeContexts = lib.genAttrs subtreeScopeIds (
-                    sid:
-                    let
-                      base = augmentedScopeContexts.${sid};
-                      entityCls = scopeEntityClassMap.${sid} or null;
-                    in
-                    if !(base ? class) && entityCls != null then
-                      base // { class = entityCls; }
-                    else if !(base ? class) then
-                      base // { class = hostClass; }
-                    else
-                      base
-                  );
-                  subtreeClassImports = lib.genAttrs subtreeScopeIds (sid: scopedClassImportsRaw.${sid} or { });
-                  subtreeProvides = lib.filterAttrs (sid: _: isRelevant sid) scopedProvides;
-                  subtreeRoutes = lib.filterAttrs (sid: _: isRelevant sid) scopedRoutes;
-                  relevantContexts = lib.genAttrs relevantScopeIds (sid: augmentedScopeContexts.${sid});
-                  subtreePhase1 = wrapPerScope ctx subtreeContexts subtreeClassImports;
-                  subtreePhase2 = applyProvides ctx relevantContexts subtreeProvides subtreePhase1;
-                  subtreePhase3 =
-                    applyRoutes fxResolveFn ctx relevantContexts hostScopeId scopeParent subtreeRoutes
-                      subtreePhase2;
-                in
-                extractSubtreeModules subtreePhase3.perScope scopeParent hostScopeId hostClass
-              else
-                null;
-            modules =
-              if preWalkedModules != null then
-                preWalkedModules
-              else
-                lib.optional (spec ? mainModule) spec.mainModule;
-            instantiateArgs =
-              if spec ? pkgs then
-                {
-                  inherit (spec) pkgs;
-                  inherit modules;
-                }
-              else
-                {
-                  inherit modules;
-                }
-                // lib.optionalAttrs (spec ? system) {
-                  modules = modules ++ [
-                    { nixpkgs.hostPlatform = lib.mkDefault spec.system; }
-                  ];
-                };
-            evaluated = spec.instantiate instantiateArgs;
-          in
           [
             {
               path = [ "flake" ] ++ spec.intoAttr;
-              value = evaluated;
+              system = spec.system or null;
+              inherit spec;
             }
           ]
       ) allInstantiates;
-      # Merge all instantiate outputs into a single module via recursiveUpdate.
-      # This avoids conflicting definitions at intermediate lazyAttrsOf keys
-      # (e.g., multiple instantiates targeting different keys under the same
-      # freeform parent). Leaf values remain lazy — recursiveUpdate only
-      # merges attrset structure, not leaf thunks.
-      instantiateConfigs = map (entry: lib.setAttrByPath entry.path entry.value) instantiateModules;
+
+      # Disambiguate instantiate entries targeting the same output path from
+      # different entities. When the same user name appears on multiple systems
+      # (e.g. den.homes.x86_64-linux.ben + den.homes.aarch64-darwin.ben both
+      # producing homeConfigurations.ben), lib.recursiveUpdate would deeply
+      # merge the two independent module-system evaluations, corrupting both.
+      # Fix: qualify each colliding entry's output name with its system so both
+      # are accessible (e.g. homeConfigurations."ben@x86_64-linux").
+      # Same-entity duplicates (e.g. fleet + direct policy) are left as-is
+      # since they produce compatible modules.
+      #
+      # Only inspects path and system metadata — never touches spec.instantiate.
+      disambiguated =
+        let
+          pathStr = builtins.concatStringsSep ".";
+          grouped = builtins.foldl' (
+            acc: entry:
+            let
+              key = pathStr entry.path;
+            in
+            acc // { ${key} = (acc.${key} or [ ]) ++ [ entry ]; }
+          ) { } specDescriptors;
+          resolve =
+            _: entries:
+            if builtins.length entries <= 1 then
+              entries
+            else
+              let
+                systems = map (e: e.system or null) entries;
+                uniqueSystems = lib.unique systems;
+                isMultiSystem = builtins.length uniqueSystems > 1;
+              in
+              if isMultiSystem then
+                # Different systems: qualify each output name with @system.
+                map (
+                  e:
+                  let
+                    basePath = lib.init e.path;
+                    baseName = lib.last e.path;
+                  in
+                  e // { path = basePath ++ [ "${baseName}@${e.system}" ]; }
+                ) entries
+              else
+                # Same entity via multiple policy paths: deduplicate.
+                let
+                  entry = lib.last entries;
+                in
+                lib.warnIf (builtins.length entries > 1)
+                  "den: multiple instantiate specs target ${builtins.concatStringsSep "." entry.path} on ${
+                    if entry.system != null then entry.system else "unknown"
+                  }; keeping last"
+                  [ entry ];
+        in
+        lib.concatLists (lib.mapAttrsToList resolve grouped);
+
+      # Build lazy output tree.  Each leaf calls spec.instantiate on first access.
+      instantiateConfigs = map (
+        entry: lib.setAttrByPath entry.path (entry.spec.instantiate (mkArgs entry.spec))
+      ) disambiguated;
     in
     classImports
     // {
@@ -401,102 +484,71 @@ let
       scopedProvides = result.state.scopedProvides null;
       scopedRoutes = result.state.scopedRoutes null;
 
-      # Pipe-data-free host configs for cross-host config thunk resolution.
-      # Uses original (non-augmented) scope contexts so modules don't receive
-      # pipe data args, breaking the cycle: assemblePipes → hostConfigs → evalModules → pipe data.
-      # Local thunks are marked and resolved inside evalModules via the fixpoint config.
-      hostConfigs =
+      # Scan raw pipe values for config-dependent thunks (functions taking
+      # { config, ... }).  If none exist, hostConfigs stays null and
+      # assemblePipes skips cross-host instantiation entirely.
+      isConfigDependent = val: builtins.isFunction val && (builtins.functionArgs val) ? config;
+      hasAnyConfigThunk =
         let
-          allInstantiates = lib.concatLists (lib.attrValues (result.state.scopedInstantiates null));
-          allScopeIds = builtins.attrNames scopeContexts;
-          specsByHost = builtins.listToAttrs (
-            lib.concatMap (
-              spec:
-              let
-                hasOutput = (spec.intoAttr or [ ]) != [ ];
-                hostScopeId = if hasOutput then findHostScopeId scopeParent allScopeIds spec else null;
-              in
-              if hostScopeId == null then
-                [ ]
-              else
-                [
-                  {
-                    name = hostScopeId;
-                    value = spec;
-                  }
-                ]
-            ) allInstantiates
-          );
+          # Values may be lists of entries, raw functions, or pipe entry
+          # records ({ __isPipeEntry; module = <fn>; ... }).
+          checkVal =
+            v:
+            if builtins.isList v then
+              builtins.any checkVal v
+            else if builtins.isAttrs v && v ? module then
+              isConfigDependent v.module
+            else
+              isConfigDependent v;
         in
-        lib.mapAttrs (
-          hostScopeId: spec:
+        builtins.any (scopeImports: builtins.any checkVal (lib.attrValues scopeImports)) (
+          lib.attrValues scopedClassImportsRaw
+        );
+
+      # Pipe-data-free host configs for cross-host config-dependent thunk
+      # resolution.  Only computed when config-dependent thunks actually exist
+      # in the pipe data.  When null, resolveThunks still resolves
+      # pipeline-parametric emits, but config-dependent collected emits are
+      # deferred (resolveEntry returns them unchanged).
+      hostConfigs =
+        if !hasAnyConfigThunk then
+          null
+        else
           let
-            hostClass = spec.class or "nixos";
-            isInSubtree =
-              sid:
-              sid == hostScopeId
-              || (
+            allInstantiates = lib.concatLists (lib.attrValues (result.state.scopedInstantiates null));
+            allScopeIds = builtins.attrNames scopeContexts;
+            specsByHost = builtins.listToAttrs (
+              lib.concatMap (
+                spec:
                 let
-                  parent = scopeParent.${sid} or null;
+                  hasOutput = (spec.intoAttr or [ ]) != [ ];
+                  hostScopeId = if hasOutput then findHostScopeId scopeParent allScopeIds spec else null;
                 in
-                parent != null && parent != sid && isInSubtree parent
-              );
-            isAncestor =
-              sid:
-              let
-                parent = scopeParent.${hostScopeId} or null;
-              in
-              sid == parent || (parent != null && parent != hostScopeId && isAncestorOf scopeParent sid parent);
-            isRelevant = sid: isInSubtree sid || isAncestor sid;
-            subtreeScopeIds = builtins.filter isInSubtree allScopeIds;
-            relevantScopeIds = builtins.filter isRelevant allScopeIds;
-            scopeEntityClassMap = (result.state.scopeEntityClass or (_: { })) null;
-            subtreeContexts = lib.genAttrs subtreeScopeIds (
-              sid:
-              let
-                base = scopeContexts.${sid};
-                entityCls = scopeEntityClassMap.${sid} or null;
-              in
-              if !(base ? class) && entityCls != null then
-                base // { class = entityCls; }
-              else if !(base ? class) then
-                base // { class = hostClass; }
-              else
-                base
+                if hostScopeId == null then
+                  [ ]
+                else
+                  [
+                    {
+                      name = hostScopeId;
+                      value = spec;
+                    }
+                  ]
+              ) allInstantiates
             );
-            subtreeClassImports = lib.genAttrs subtreeScopeIds (sid: scopedClassImportsRaw.${sid} or { });
-            subtreeProvides = lib.filterAttrs (sid: _: isRelevant sid) scopedProvides;
-            subtreeRoutes = lib.filterAttrs (sid: _: isRelevant sid) scopedRoutes;
-            relevantContexts = lib.genAttrs relevantScopeIds (sid: scopeContexts.${sid});
-            subtreePhase1 = wrapPerScope ctx subtreeContexts subtreeClassImports;
-            subtreePhase2 = applyProvides ctx relevantContexts subtreeProvides subtreePhase1;
-            subtreePhase3 =
-              applyRoutes (fxResolve mkPipeline) ctx relevantContexts hostScopeId scopeParent subtreeRoutes
-                subtreePhase2;
-            preWalkedModules = extractSubtreeModules subtreePhase3.perScope scopeParent hostScopeId hostClass;
-            modules =
-              if preWalkedModules != null then
-                preWalkedModules
-              else
-                lib.optional (spec ? mainModule) spec.mainModule;
-            instantiateArgs =
-              if spec ? pkgs then
-                {
-                  inherit (spec) pkgs;
-                  inherit modules;
-                }
-              else
-                {
-                  inherit modules;
-                }
-                // lib.optionalAttrs (spec ? system) {
-                  modules = modules ++ [
-                    { nixpkgs.hostPlatform = lib.mkDefault spec.system; }
-                  ];
-                };
+            mkArgs = mkInstantiateArgs {
+              augmentedScopeContexts = scopeContexts;
+              inherit
+                scopedClassImportsRaw
+                scopedProvides
+                scopedRoutes
+                scopeParent
+                ;
+              scopeEntityClass = result.state.scopeEntityClass or (_: { });
+              spawnNodeFn = spawnNode;
+              inherit ctx;
+            };
           in
-          (spec.instantiate instantiateArgs).config
-        ) specsByHost;
+          lib.mapAttrs (_: spec: (spec.instantiate (mkArgs spec)).config) specsByHost;
 
       # Assemble pipe data into scope contexts before wrapping.
       # Local config thunks are marked for deferred resolution inside evalModules.
@@ -508,6 +560,37 @@ let
         scopedPipeEffects = result.state.scopedPipeEffects null;
         inherit scopeParent;
       };
+
+      # Parent-state bundle for node spawns. Uses the RAW scopeContexts and
+      # scopedClassImports (not the augmented/drained maps): the spawned node
+      # re-derives pipes via its OWN assemblePipes over the merged state, so
+      # threading the augmented map would double-apply and feeding the drained
+      # map (which depends on this bundle) would cycle. scopeEntityKind is the
+      # already-unwrapped binding above. scopedClassImports here covers host +
+      # all siblings, which collectAll needs to find fleet peers.
+      parentState = {
+        inherit
+          scopeContexts
+          scopeParent
+          ctx
+          scopeEntityKind
+          ;
+        scopedClassImports = scopedClassImportsRaw;
+        scopedPipeEffects = result.state.scopedPipeEffects null;
+      };
+      # Recursive: a nested complex forward inside a spawned node resolves its
+      # source via this SAME threaded primitive (not an isolated pipeline), so
+      # nested forwards stay fleet-visible and the resolver contract matches
+      # resolveSourceFallback's { from, class, aspect, bindings } call. Nix lets
+      # are lazy, so the self-reference is fine — selfRef is only invoked at
+      # runtime when a resolved aspect carries a complex non-collected forward,
+      # and a finite forward nesting terminates.
+      spawnNode = mkSpawnNode {
+        inherit wrapPerScope applyProvides applyRoutes;
+        inherit (den.lib.aspects) normalizeRoot;
+        inherit (den.lib.aspects.fx.aspect) ctxFromHandlers;
+        selfRef = spawnNode;
+      } mkPipeline parentState;
 
       # Post-assembly drain: resolve deferred includes.
       # Two categories of deferred includes are drained here:
@@ -548,60 +631,103 @@ let
               inherited = lib.filterAttrs (k: _: !(ownCtx ? ${k})) ancestorCtx;
             in
             ownCtx // inherited;
+
+          baseDrain = lib.foldl' (
+            accImports: scopeId:
+            let
+              deferred = allDeferred.${scopeId} or [ ];
+              scopeCtx = enrichedScopeCtx scopeId;
+              # Drain all deferred includes whose args are now satisfied,
+              # not just pipe-arg deferred ones.
+              drainable = builtins.filter (d: builtins.all (k: scopeCtx ? ${k}) (d.requiredArgs or [ ])) deferred;
+            in
+            if drainable == [ ] then
+              accImports
+            else
+              let
+                newEntries = lib.concatMap (
+                  d:
+                  let
+                    child = d.child;
+                    classified = classifyKeys null child;
+                  in
+                  lib.concatMap (
+                    k:
+                    let
+                      modules = unwrapContentValuesList child.${k};
+                    in
+                    map (module: {
+                      __rawEntry = true;
+                      class = k;
+                      inherit module;
+                      ctx = scopeCtx;
+                      identity = child.name or "<deferred>";
+                      aspectPolicy = child.meta.collisionPolicy or null;
+                      globalPolicy = den.config.classModuleCollisionPolicy or "error";
+                      isContextDependent = false;
+                    }) modules
+                  ) classified.classKeys
+                ) drainable;
+              in
+              builtins.foldl' (
+                acc: entry:
+                acc
+                // {
+                  ${scopeId} = (acc.${scopeId} or { }) // {
+                    ${entry.class} = ((acc.${scopeId} or { }).${entry.class} or [ ]) ++ [ entry ];
+                  };
+                }
+              ) accImports newEntries
+          ) scopedClassImportsRaw (builtins.attrNames allDeferred);
+
+          # Materialize deferred node spawn markers (policy.spawn) over
+          # the parent scope-tree state. Each marker lives at a user scope; the
+          # home class is re-walked from that user's host aspect with `user`
+          # bound, threaded with host + sibling state so fleet-collected pipes
+          # resolve to data and collectAll sees every peer. The result is folded
+          # into the user scope's class buckets so BOTH phase1 and the phase4
+          # per-host re-walk (over drainedClassImportsRaw) deliver it.
+          allHomeNodes = (result.state.scopedSpawns or (_: { })) null;
         in
         lib.foldl' (
-          accImports: scopeId:
+          acc: scopeId:
           let
-            deferred = allDeferred.${scopeId} or [ ];
-            scopeCtx = enrichedScopeCtx scopeId;
-            # Drain all deferred includes whose args are now satisfied,
-            # not just pipe-arg deferred ones.
-            drainable = builtins.filter (d: builtins.all (k: scopeCtx ? ${k}) (d.requiredArgs or [ ])) deferred;
+            sctx = scopeContexts.${scopeId} or { };
+            host = sctx.host or null;
+            user = sctx.user or null;
+            from = scopeParent.${scopeId} or null;
+            specs = allHomeNodes.${scopeId};
+            defaultClasses = user.classes or [ "homeManager" ];
+            classes = lib.unique (
+              lib.concatMap (s: if s.classes != null then s.classes else defaultClasses) specs
+            );
           in
-          if drainable == [ ] then
-            accImports
+          if host == null || from == null then
+            acc
           else
-            let
-              newEntries = lib.concatMap (
-                d:
-                let
-                  child = d.child;
-                  classified = classifyKeys null child;
-                in
-                lib.concatMap (
-                  k:
-                  let
-                    modules = unwrapContentValuesList child.${k};
-                  in
-                  map (module: {
-                    __rawEntry = true;
-                    class = k;
-                    inherit module;
-                    ctx = scopeCtx;
-                    identity = child.name or "<deferred>";
-                    aspectPolicy = child.meta.collisionPolicy or null;
-                    globalPolicy = den.config.classModuleCollisionPolicy or "error";
-                    isContextDependent = false;
-                  }) modules
-                ) classified.classKeys
-              ) drainable;
-            in
-            builtins.foldl' (
-              acc: entry:
-              acc
-              // {
-                ${scopeId} = (acc.${scopeId} or { }) // {
-                  ${entry.class} = ((acc.${scopeId} or { }).${entry.class} or [ ]) ++ [ entry ];
-                };
-              }
-            ) accImports newEntries
-        ) scopedClassImportsRaw (builtins.attrNames allDeferred);
+            acc
+            // {
+              ${scopeId} =
+                (acc.${scopeId} or { })
+                // lib.genAttrs classes (
+                  cls:
+                  ((acc.${scopeId} or { }).${cls} or [ ])
+                  ++ (spawnNode {
+                    inherit from;
+                    class = cls;
+                    aspect = host.aspect;
+                    bindings = {
+                      inherit user;
+                    };
+                  }).imports
+                );
+            }
+        ) baseDrain (builtins.attrNames allHomeNodes);
 
       phase1 = wrapPerScope ctx augmentedScopeContexts drainedClassImportsRaw;
       phase2 = applyProvides ctx augmentedScopeContexts scopedProvides phase1;
       phase3 =
-        applyRoutes (fxResolve mkPipeline) ctx augmentedScopeContexts result.state.rootScopeId scopeParent
-          scopedRoutes
+        applyRoutes spawnNode ctx augmentedScopeContexts result.state.rootScopeId scopeParent scopedRoutes
           phase2;
       phase4 = applyInstantiates {
         scopedInstantiates = result.state.scopedInstantiates null;
@@ -616,7 +742,7 @@ let
         # Pass drained class imports so pipe-arg deferred aspects are
         # included in per-host subtree assembly.
         scopedClassImportsRaw = drainedClassImportsRaw;
-        fxResolveFn = fxResolve mkPipeline;
+        spawnNodeFn = spawnNode;
       } phase3.classImports;
     in
     {
@@ -638,19 +764,39 @@ let
       result = mkPipeline { inherit class; } { inherit self ctx; };
       scopeContexts = result.state.scopeContexts null;
       scopedClassImportsRaw = result.state.scopedClassImports null;
+      scopeParent = result.state.scopeParent null;
 
       augmentedScopeContexts = assemblePipes {
         inherit scopeContexts;
         scopedClassImports = scopedClassImportsRaw;
         scopedPipeEffects = result.state.scopedPipeEffects null;
-        scopeParent = result.state.scopeParent null;
+        inherit scopeParent;
       };
+
+      # Analogous parent-state bundle so a nested complex-route forward inside
+      # this (non-instantiating) resolution still resolves its source via a
+      # threaded spawned node rather than an isolated pipeline. No drain/phase4
+      # here, so this only matters for nested node resolution.
+      parentState = {
+        inherit scopeContexts scopeParent ctx;
+        scopeEntityKind = (result.state.scopeEntityKind or (_: { })) null;
+        scopedClassImports = scopedClassImportsRaw;
+        scopedPipeEffects = result.state.scopedPipeEffects null;
+      };
+      # Recursive: see fxResolve above. selfRef is the threaded primitive itself
+      # so a nested complex forward inside a spawned node resolves its source via
+      # the same fleet-visible spawn (matching resolveSourceFallback's contract).
+      spawnNode = mkSpawnNode {
+        inherit wrapPerScope applyProvides applyRoutes;
+        inherit (den.lib.aspects) normalizeRoot;
+        inherit (den.lib.aspects.fx.aspect) ctxFromHandlers;
+        selfRef = spawnNode;
+      } mkPipeline parentState;
 
       phase1 = wrapPerScope ctx augmentedScopeContexts scopedClassImportsRaw;
       phase2 = applyProvides ctx augmentedScopeContexts (result.state.scopedProvides null) phase1;
       phase3 =
-        applyRoutes (fxResolveImports mkPipeline) ctx augmentedScopeContexts result.state.rootScopeId
-          (result.state.scopeParent null)
+        applyRoutes spawnNode ctx augmentedScopeContexts result.state.rootScopeId scopeParent
           (result.state.scopedRoutes null)
           phase2;
     in

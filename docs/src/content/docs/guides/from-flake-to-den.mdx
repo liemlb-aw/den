@@ -6,7 +6,7 @@ description: Clean start with Den
 import { Aside, Steps } from '@astrojs/starlight/components';
 
 <Aside type="tip" title="Shortcut: See templates/minimal">
-This is a step-by-step tutorial for learn-by-doing people.
+This is a step-by-step how-to for learn-by-doing people.
 
 It is very **very recommended** that you have also read [**From Zero to Den**](/guides/from-zero-to-den) since it **introduces Den concepts** that will not be explained again here.
 
@@ -39,7 +39,7 @@ Suppose you have a flake like this with a `nixosConfigurations.igloo`:
     # all your config, most importantly a NixOS like `igloo`:
     nixosConfigurations.igloo = lib.nixosSystem { 
       modules = [ 
-         <all your curent NixOS modules> 
+         <all your current NixOS modules> 
       ];
     };
     darwinConfigurations.iceberg = darwinSystem {
@@ -108,7 +108,7 @@ Den batteries like `den.batteries.define-user` and `den.batteries.primary-user` 
     # all your config, most importantly a NixOS like `igloo`:
     nixosConfigurations.igloo = nixosSystem { 
       modules = [ 
-         <all your curent NixOS modules> 
+         <all your current NixOS modules> 
 +         igloo.mainModule
       ];
     };
@@ -173,7 +173,7 @@ you can have a flake like this:
 
 ## Den-only flake outputs
 
-Even more, if you have defined all flake outputs as Dendritic
+Even more, if you have defined all flake outputs as aspect-oriented
 `flake` outputs inside `modules/` your final `flake.nix` becomes:
 
 ```nix "config.flake"
